@@ -1,22 +1,35 @@
-import yfinance as yf
+# =========================
+# src/data_loader.py
+# Data loading utilities
+# =========================
+
 import pandas as pd
 
-def load_price_data(tickers, hist_days):
+UNIVERSE_FILE = "universe.csv"  # repo root
+
+def load_universe_prices(total_days=None):
     """
-    Downloads adjusted close price data for a list of tickers.
-    Returns a dict: { ticker: pd.Series }
+    Load universe prices as a DataFrame
+    total_days: optional, number of business days to fetch
     """
+    import pandas as pd
+    import yfinance as yf
+
+    try:
+        tickers = pd.read_csv("universe.csv")["Ticker"].dropna().tolist()
+    except FileNotFoundError:
+        tickers = ["BURU","CRBP","KITT","SRRK","RIO"]
+
+    period = f"{total_days}d" if total_days is not None else "180d"
+
     data = yf.download(
         tickers,
-        period=f"{hist_days}d",
+        period=period,
         auto_adjust=True,
         group_by="ticker",
         progress=False
     )
 
-    prices = {}
-    for t in tickers:
-        prices[t] = data[t]["Close"].dropna()
-
+    prices = pd.DataFrame({t: data[t]["Close"] for t in tickers})
     return prices
 

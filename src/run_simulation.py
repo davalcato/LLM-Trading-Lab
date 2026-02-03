@@ -1,79 +1,115 @@
+# =========================
+# src/run_simulation.py
+# Canonical simulation entry point for Portfolio
+# =========================
+
+import numpy as np
 import pandas as pd
-from config import *
-from data_loader import load_price_data
-from monte_carlo import monte_carlo_paths
-from signals import signal_engine
-from portfolio import compute_metrics
+from pathlib import Path
 
-# Load universe
-tickers = pd.read_csv("data/universe.csv")["Ticker"].dropna().tolist()
-prices = load_price_data(tickers, HIST_DAYS)
+from src.config import (
+    INITIAL_CAPITAL,
+    MAX_POSITION_PCT,
+    BUY_ZSCORE,
+    SELL_ZSCORE,
+    HIST_DAYS,
+    FORECAST_DAYS,
+    RANDOM_SEED
+)
+from src.data_loader import load_universe_prices
+from src.portfolio import Portfolio, compute_metrics
 
-cash = STARTING_CASH
-positions = {t: 0 for t in tickers}
+# ----------------------------
+# Signal Generation
+# ----------------------------
+def generate_signal(price, history, buy_z=BUY_ZSCORE, sell_z=SELL_ZSCORE):
+    """
+    Compute z-score and generate BUY / SELL / HOLD signal
+    """
+    mean = history.mean()
+    std = history.std()
 
-equity_curve = []
-trade_log = []
+    if std == 0:
+        return "HOLD"
 
-# Precompute forecasts
-forecasts = {
-    t: monte_carlo_paths(prices[t], FORECAST_DAYS, MC_SIMULATIONS).mean(axis=1)
-    for t in tickers
-}
+    z = (price - mean) / std
 
-total_days = HIST_DAYS + FORECAST_DAYS
+    if z <= buy_z:
+        return "BUY"
+    elif z >= sell_z:
+        return "SELL"
+    else:
+        return "HOLD"
 
-for day in range(total_days):
-    for t in tickers:
-        hist_series = prices[t].iloc[:min(day + 1, HIST_DAYS)]
+# ----------------------------
+# Simulation Loop
+# ----------------------------
+def run_simulation():
+    np.random.seed(RANDOM_SEED)
 
-        price = (
-            hist_series.iloc[-1]
-            if day < HIST_DAYS
-            else forecasts[t].iloc[day - HIST_DAYS]
-        )
+    # Load price data
+    price_data = load_universe_prices(HIST_DAYS + FORECAST_DAYS)
 
-        signal = signal_engine(
-            hist_series,
-            positions[t],
-            LOOKBACK,
-            LOW_PCTL,
-            HIGH_PCTL
-        )
+    # Initialize portfolio
+    portfolio = Portfolio(INITIAL_CAPITAL)
 
-        if signal == "BUY" and cash > price:
-            qty = int(cash // price)
-            cost = qty * price * (1 + TRANSACTION_COST)
-            cash -= cost
-            positions[t] += qty
-            trade_log.append([t, "BUY", qty, price])
+    # Track peak equity for drawdown calculation
+    peak_equity = INITIAL_CAPITAL
 
-        elif signal == "SELL" and positions[t] > 0:
-            proceeds = positions[t] * price * (1 - TRANSACTION_COST)
-            cash += proceeds
-            trade_log.append([t, "SELL", positions[t], price])
-            positions[t] = 0
+    # Loop over each day starting after lookback
+    lookback = 20
+    for day in range(lookback, len(price_data)):
+        today_prices = price_data.iloc[day]
+        history = price_data.iloc[day - lookback:day]
 
-    equity = cash + sum(
-        positions[t] * (
-            prices[t].iloc[-1]
-            if day < HIST_DAYS
-            else forecasts[t].iloc[day - HIST_DAYS]
-        )
-        for t in tickers
+        print(f"\n=== DAY {day} ({price_data.index[day].date()}) ===")
+
+        # Loop through tickers
+        for symbol in price_data.columns:
+            price = today_prices[symbol]
+            hist = history[symbol]
+
+            signal = generate_signal(price, hist)
+            portfolio.execute(symbol, price, signal)
+
+            print(f"{symbol}: price={price:.2f}, signal={signal}")
+
+        # Update equity
+        equity = portfolio.total_equity(today_prices.to_dict())
+        portfolio.equity_curve.append(equity)
+
+        peak_equity = max(peak_equity, equity)
+        drawdown = (peak_equity - equity) / peak_equity * 100
+
+        print(f"Total Equity: {equity:.2f}")
+        print(f"Drawdown: {drawdown:.2f}%")
+
+    # ----------------------------
+    # Export Trades & Equity
+    # ----------------------------
+    Path("output").mkdir(exist_ok=True)
+
+    trades_df = pd.DataFrame(
+        portfolio.trade_log,
+        columns=["Ticker", "Side", "Qty", "Price"]
     )
+    trades_df.to_csv("output/trades.csv", index=False)
 
-    equity_curve.append(equity)
+    equity_df = pd.Series(portfolio.equity_curve)
+    equity_df.to_csv("output/equity_curve.csv", index=False)
 
-# Save outputs
-pd.DataFrame(trade_log, columns=["Ticker","Side","Qty","Price"]).to_csv(
-    "output/trades.csv", index=False
-)
+    # ----------------------------
+    # Compute Metrics
+    # ----------------------------
+    metrics = compute_metrics(equity_df)
+    print("\n--- Metrics ---")
+    print(metrics)
 
-pd.Series(equity_curve).to_csv(
-    "output/equity_curve.csv", index=False
-)
+    return portfolio
 
-metrics = compute_metrics(pd.Series(equity_curve))
-print("Metrics:", metrics)
+# ----------------------------
+# Entry Point
+# ----------------------------
+if __name__ == "__main__":
+    run_simulation()
 
