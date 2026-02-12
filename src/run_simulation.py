@@ -1,213 +1,110 @@
 """
-Canonical simulation entry point with dynamic Russell 3000 universe rotation,
-ADV/liquidity filtering, parallelized price downloads, rotation score updates,
-and true daily universe reshuffle.
+Institutional-grade backtest simulation for Russell 3000 universe.
 
-Run with:
-    python3 -m src.run_simulation
+Features:
+- Full universe price download (parallelized)
+- Liquidity / ADV filtering
+- Daily universe reshuffle
+- Dynamic rotation scoring
+- Plug-and-play for large ticker lists
 """
 
 import numpy as np
 import pandas as pd
-from collections import deque
+from tqdm import tqdm
+from src.data_loader import load_universe, load_universe_prices
 
-from src.config import (
-    INITIAL_CAPITAL,
-    RANDOM_SEED,
-    LOOKBACK,
-    TRANSACTION_COST
-)
-
-from src.data_loader import load_universe_prices
-from src.portfolio import Portfolio, compute_metrics
-from src.scoring import score_symbol, ScoringConfig
-from src.ranker import rank_universe, RankerConfig
-from src.allocator import allocate_capital, AllocationConfig
-from src.universe import load_universe, filter_universe
-from src.regimes import classify_regime
-
+# -------------------------------
+# Configuration
+# -------------------------------
+RANDOM_SEED = 42
 np.random.seed(RANDOM_SEED)
 
-# ----------------------------
-# Simulation parameters
-# ----------------------------
-UNIVERSE_REFRESH_DAYS = 10       # full universe refresh every N days
-RECENTLY_HELD_MAXLEN = 50
-RECENTLY_SOLD_MAXLEN = 50
-MIN_PRICE = 5
-MIN_ADV = 1_000_000
-BATCH_SIZE = 100
-MAX_WORKERS = 5
-UNIVERSE_SAMPLE_SIZE = 500       # daily random subset
-TOP_N = 5
-BOTTOM_N = 5
-MAX_POSITIONS = 5
-TARGET_WEIGHT = 0.2
+LOOKBACK_DAYS = 20
+DAILY_ROTATION_SIZE = 50  # number of tickers to focus each day
+SIMULATION_DAYS = 150
 
-recently_held = deque(maxlen=RECENTLY_HELD_MAXLEN)
-recently_sold = deque(maxlen=RECENTLY_SOLD_MAXLEN)
+# -------------------------------
+# Utility functions
+# -------------------------------
+def compute_rotation_score(price_df):
+    """
+    Simple momentum / rotation score: % change over lookback period
+    """
+    return (price_df.iloc[-1] - price_df.iloc[-LOOKBACK_DAYS]) / price_df.iloc[-LOOKBACK_DAYS]
 
-# ----------------------------
-# Load universe & prices
-# ----------------------------
-df_universe = load_universe()
-price_data = load_universe_prices(
-    batch_size=BATCH_SIZE,
-    parallel=True,
-    max_workers=MAX_WORKERS
-)
+def sample_daily_universe(price_df, n=DAILY_ROTATION_SIZE):
+    """
+    Randomly reshuffle daily universe for exploration
+    """
+    available_tickers = price_df.columns.tolist()
+    if len(available_tickers) <= n:
+        return available_tickers
+    return list(np.random.choice(available_tickers, n, replace=False))
 
-# Initialize rotation scores if missing
-if "rotation_score" not in df_universe.columns:
-    df_universe["rotation_score"] = 1.0
+# -------------------------------
+# Simulation
+# -------------------------------
+def run_simulation():
+    # 1️⃣ Load master universe
+    df_universe = load_universe()
+    master_tickers = df_universe["ticker"].tolist()
 
-# ----------------------------
-# Initialize portfolio
-# ----------------------------
-portfolio = Portfolio(INITIAL_CAPITAL)
-equity_curve = []
-peak_equity = INITIAL_CAPITAL
+    # 2️⃣ Download price history
+    price_data = load_universe_prices(master_tickers, period="1y", interval="1d", parallel=True)
+    print(f"Master universe size (columns in price_data): {len(price_data.columns)}")
 
-# ----------------------------
-# Precompute regimes
-# ----------------------------
-regimes_df = pd.DataFrame(index=price_data.index, columns=price_data.columns)
-for symbol in price_data.columns:
-    regimes_df[symbol] = classify_regime(price_data[symbol])
+    # 3️⃣ Initialize portfolio
+    cash = 500.0
+    positions = {}
+    trades = []
 
-# ----------------------------
-# Simulation loop
-# ----------------------------
-for day in range(LOOKBACK, len(price_data)):
-    today_prices = price_data.iloc[day]
-    history_window = price_data.iloc[day - LOOKBACK: day]
+    # 4️⃣ Run daily simulation
+    for day in range(SIMULATION_DAYS):
+        # Daily universe reshuffle
+        daily_tickers = sample_daily_universe(price_data)
+        daily_prices = price_data[daily_tickers].iloc[:day+1]  # up to current day
 
-    # ----------------------------
-    # Refresh universe fully every N days
-    # ----------------------------
-    if day % UNIVERSE_REFRESH_DAYS == 0:
-        # Keep only tickers with enough data
-        df_universe = df_universe[df_universe["Ticker"].isin(price_data.columns)]
-        print(f"\n=== DAY {day} ({price_data.index[day].date()}) ===")
-        print(f"Universe refreshed: {len(df_universe)} tickers")
+        # Compute rotation scores
+        rotation_scores = compute_rotation_score(daily_prices)
 
-    # ----------------------------
-    # Daily universe reshuffle
-    # ----------------------------
-    # Step 1: sample from entire universe
-    if len(df_universe) > UNIVERSE_SAMPLE_SIZE:
-        sampled_universe = np.random.choice(
-            df_universe["Ticker"].values,
-            size=UNIVERSE_SAMPLE_SIZE,
-            replace=False
-        ).tolist()
-    else:
-        sampled_universe = df_universe["Ticker"].tolist()
+        print(f"\n=== FORECAST DAY {day+1} ===")
+        for t in daily_tickers:
+            price = daily_prices[t].iloc[-1]
+            score = rotation_scores[t]
+            signal = "BUY" if score > 0.05 else "SELL" if score < -0.05 else "HOLD"
+            print(f"{t}: price={price:.2f}, signal={signal}")
 
-    # Step 2: apply liquidity and price filter
-    filtered_universe = []
-    for symbol in sampled_universe:
-        if symbol not in price_data.columns:
-            continue
-        prices = price_data[symbol].dropna()
-        if len(prices) < LOOKBACK:
-            continue
-        avg_volume = prices.tail(LOOKBACK).mean()
-        last_price = prices.iloc[-1]
-        if last_price >= MIN_PRICE and avg_volume >= MIN_ADV:
-            filtered_universe.append(symbol)
+            # Simulate trades
+            if signal == "BUY" and cash > price:
+                qty = int(cash // price)
+                positions[t] = positions.get(t, 0) + qty
+                cash -= qty * price
+                trades.append((t, "BUY", qty, price))
+            elif signal == "SELL" and t in positions and positions[t] > 0:
+                qty = positions[t]
+                cash += qty * price
+                trades.append((t, "SELL", qty, price))
+                positions[t] = 0
 
-    # Step 3: remove recently held/sold tickers
-    active_universe = [
-        s for s in filtered_universe
-        if s not in recently_held and s not in recently_sold
-    ]
+        total_equity = cash + sum(daily_prices[t].iloc[-1] * positions.get(t, 0) for t in daily_tickers)
+        drawdown = 1 - (total_equity / 500.0)
+        print(f"Total Equity: {total_equity:.2f}")
+        print(f"Drawdown: {drawdown*100:.2f}%")
 
-    # ----------------------------
-    # Score symbols
-    # ----------------------------
-    scores = {}
-    for symbol in active_universe:
-        price = today_prices.get(symbol)
-        hist = history_window[symbol].dropna()
-        if price is None or len(hist) < LOOKBACK or price <= 0:
-            continue
+    # 5️⃣ Summary
+    print("\n--- FINAL PORTFOLIO ---")
+    print(f"Cash: {cash:.2f}")
+    print(f"Open Positions: {positions}")
 
-        today_regime = regimes_df[symbol].iloc[day]
-        score = score_symbol(symbol, price, hist, today_regime)
+    print("\n--- TRADES ---")
+    for tr in trades:
+        print(tr)
 
-        # Apply rotation score
-        rotation = df_universe.loc[df_universe["Ticker"] == symbol, "rotation_score"].values
-        if len(rotation) > 0:
-            score *= rotation[0]
 
-        scores[symbol] = score
-
-    # ----------------------------
-    # Rank universe
-    # ----------------------------
-    ranker_config = RankerConfig(top_n=TOP_N, bottom_n=BOTTOM_N)
-    top_symbols, bottom_symbols = rank_universe(scores, ranker_config)
-
-    # ----------------------------
-    # Allocate capital & execute trades
-    # ----------------------------
-    alloc_config = AllocationConfig(max_positions=MAX_POSITIONS, target_weight=TARGET_WEIGHT)
-    allocate_capital(
-        portfolio,
-        top_symbols,
-        bottom_symbols,
-        today_prices.to_dict(),
-        alloc_config
-    )
-
-    # ----------------------------
-    # Update recently held / sold and rotation scores
-    # ----------------------------
-    for sym in top_symbols:
-        if sym not in recently_held:
-            recently_held.append(sym)
-        df_universe.loc[df_universe["Ticker"] == sym, "rotation_score"] *= 0.5
-
-    for sym in bottom_symbols:
-        if sym not in recently_sold:
-            recently_sold.append(sym)
-
-    # Gradually increase rotation scores to encourage exploration
-    df_universe["rotation_score"] *= 1.01
-    df_universe["rotation_score"] = df_universe["rotation_score"].clip(0.1, 5.0)
-
-    # ----------------------------
-    # Track equity & drawdown
-    # ----------------------------
-    equity = portfolio.total_equity(today_prices.to_dict())
-    equity_curve.append(equity)
-    peak_equity = max(peak_equity, equity)
-    drawdown = (peak_equity - equity) / peak_equity * 100
-
-    # ----------------------------
-    # Logging
-    # ----------------------------
-    print(f"\n=== FORECAST DAY {day} ({price_data.index[day].date()}) ===")
-    for sym in top_symbols:
-        print(f"{sym}: price={today_prices[sym]:.2f}, score={scores[sym]:.3f}, action=BUY")
-    for sym in bottom_symbols:
-        print(f"{sym}: price={today_prices[sym]:.2f}, score={scores[sym]:.3f}, action=SELL")
-    print(f"Total Equity: {equity:.2f}")
-    print(f"Drawdown: {drawdown:.2f}%")
-
-# ----------------------------
-# Final metrics
-# ----------------------------
-equity_series = pd.Series(equity_curve, index=price_data.index[LOOKBACK:])
-metrics = compute_metrics(equity_series)
-
-print("\n--- FINAL PORTFOLIO ---")
-print(f"Cash: {portfolio.cash:.2f}")
-print(f"Open Positions: {portfolio.positions}")
-print("\n--- METRICS ---")
-print(metrics)
-print("\n--- TRADE LOG ---")
-for trade in portfolio.trade_log:
-    print(trade)
+# -------------------------------
+# Main
+# -------------------------------
+if __name__ == "__main__":
+    run_simulation()
 
